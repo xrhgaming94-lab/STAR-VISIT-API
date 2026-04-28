@@ -1,13 +1,11 @@
-from fastapi import FastAPI, Query
-from fastapi.responses import JSONResponse
+from flask import Flask, jsonify
 import aiohttp
 import asyncio
 import json
-
 from byte import encrypt_api, Encrypt_ID
-from visit_count_pb2 import Info
+from visit_count_pb2 import Info  # Import the generated protobuf class
 
-app = FastAPI()
+app = Flask(__name__)
 
 def load_tokens(server_name):
     try:
@@ -17,17 +15,18 @@ def load_tokens(server_name):
             path = "token_br.json"
         else:
             path = "token_bd.json"
+
         with open(path, "r") as f:
             data = json.load(f)
-        tokens = [item["token"] for item in data if item.get("token") and item["token"] not in ["", "N/A"]]
-        print(f"Loaded {len(tokens)} tokens for {server_name}")
+
+        tokens = [item["token"] for item in data if "token" in item and item["token"] not in ["", "N/A"]]
         return tokens
     except Exception as e:
-        print(f"Token load error for {server_name}: {e}")
+        app.logger.error(f"❌ Token load error for {server_name}: {e}")
         return []
 
 def get_url(server_name):
-    if server_name == "IND":  
+    if server_name == "IND":
         return "https://client.ind.freefiremobile.com/GetPlayerPersonalShow"
     elif server_name in {"BR", "US", "SAC", "NA"}:
         return "https://client.us.freefiremobile.com/GetPlayerPersonalShow"
@@ -38,15 +37,17 @@ def parse_protobuf_response(response_data):
     try:
         info = Info()
         info.ParseFromString(response_data)
-        return {
-            "uid": info.AccountInfo.UID or 0,
-            "nickname": info.AccountInfo.PlayerNickname or "",
-            "likes": info.AccountInfo.Likes or 0,
-            "region": info.AccountInfo.PlayerRegion or "",
-            "level": info.AccountInfo.Levels or 0
+        
+        player_data = {
+            "uid": info.AccountInfo.UID if info.AccountInfo.UID else 0,
+            "nickname": info.AccountInfo.PlayerNickname if info.AccountInfo.PlayerNickname else "",
+            "likes": info.AccountInfo.Likes if info.AccountInfo.Likes else 0,
+            "region": info.AccountInfo.PlayerRegion if info.AccountInfo.PlayerRegion else "",
+            "level": info.AccountInfo.Levels if info.AccountInfo.Levels else 0
         }
+        return player_data
     except Exception as e:
-        print(f"Protobuf error: {e}")
+        app.logger.error(f"❌ Protobuf parsing error: {e}")
         return None
 
 async def visit(session, url, token, uid, data):
@@ -59,79 +60,79 @@ async def visit(session, url, token, uid, data):
     try:
         async with session.post(url, headers=headers, data=data, ssl=False) as resp:
             if resp.status == 200:
-                return True, await resp.read()
+                response_data = await resp.read()
+                return True, response_data
             else:
-                print(f"Visit failed with status {resp.status} for token {token[:20]}...")
                 return False, None
     except Exception as e:
-        print(f"Visit error: {e}")
+        app.logger.error(f"❌ Visit error: {e}")
         return False, None
 
-async def send_visits(tokens, uid, server_name, target_success=10000):
+async def send_until_10000_success(tokens, uid, server_name, target_success=10000):
     url = get_url(server_name)
-    print(f"Using URL: {url} for region {server_name}")
     connector = aiohttp.TCPConnector(limit=0)
     total_success = 0
     total_sent = 0
+    first_success_response = None
     player_info = None
 
     async with aiohttp.ClientSession(connector=connector) as session:
         encrypted = encrypt_api("08" + Encrypt_ID(str(uid)) + "1801")
         data = bytes.fromhex(encrypted)
-        token_count = len(tokens)
 
         while total_success < target_success:
             batch_size = min(target_success - total_success, 300)
-            tasks = []
-            for i in range(batch_size):
-                token = tokens[(total_sent + i) % token_count]
-                tasks.append(asyncio.create_task(visit(session, url, token, uid, data)))
+            tasks = [
+                asyncio.create_task(visit(session, url, tokens[(total_sent + i) % len(tokens)], uid, data))
+                for i in range(batch_size)
+            ]
             results = await asyncio.gather(*tasks)
-
-            for success, response in results:
-                if success and response and player_info is None:
-                    player_info = parse_protobuf_response(response)
-                    if player_info:
-                        print(f"Captured player info: {player_info['nickname']}")
-
+            
+            if first_success_response is None:
+                for success, response in results:
+                    if success and response is not None:
+                        first_success_response = response
+                        player_info = parse_protobuf_response(response)
+                        break
+            
             batch_success = sum(1 for r, _ in results if r)
             total_success += batch_success
             total_sent += batch_size
-            print(f"Batch sent: {batch_size}, Success: {batch_success}, Total: {total_success}")
+
+            print(f"Batch sent: {batch_size}, Success in batch: {batch_success}, Total success so far: {total_success}")
 
     return total_success, total_sent, player_info
 
-@app.get("/visit")
-async def visit_endpoint(
-    uid: int = Query(..., description="Free Fire User ID"),
-    region: str = Query("IND", description="Region: IND, BR, US, BD, SAC, NA")
-):
-    server = region.upper()
+@app.route('/<string:server>/<int:uid>', methods=['GET'])
+def send_visits(server, uid):
+    server = server.upper()
     tokens = load_tokens(server)
-    if not tokens:
-        return JSONResponse(status_code=500, content={"error": f"No valid tokens found for region {server}"})
-
     target_success = 10000
-    total_success, total_sent, player_info = await send_visits(tokens, uid, server, target_success)
+
+    if not tokens:
+        return jsonify({"error": "❌ No valid tokens found"}), 500
+
+    print(f"🚀 Sending visits to UID: {uid} using {len(tokens)} tokens")
+    print(f"Waiting for total {target_success} successful visits...")
+
+    total_success, total_sent, player_info = asyncio.run(send_until_10000_success(
+        tokens, uid, server,
+        target_success=target_success
+    ))
 
     if player_info:
-        return {
-            "success": total_success,
+        player_info_response = {
             "fail": target_success - total_success,
-            "uid": player_info["uid"],
-            "nickname": player_info["nickname"],
-            "likes": player_info["likes"],
-            "level": player_info["level"],
-            "region": player_info["region"],
-            "total_requests": total_sent
+            "level": player_info.get("level", 0),
+            "likes": player_info.get("likes", 0),
+            "nickname": player_info.get("nickname", ""),
+            "region": player_info.get("region", ""),
+            "success": total_success,
+            "uid": player_info.get("uid", 0)
         }
+        return jsonify(player_info_response), 200
     else:
-        return JSONResponse(status_code=500, content={"error": "Could not decode player information. Tokens may be invalid for this region."})
+        return jsonify({"error": "Could not decode player information"}), 500
 
-@app.get("/")
-def root():
-    return {"message": "Free Fire Visit API", "usage": "/visit?uid=123&region=IND"}
-
-@app.get("/health")
-def health():
-    return {"status": "ok"}
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=5000)

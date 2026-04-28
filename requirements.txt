@@ -1,5 +1,4 @@
-fastapi
-uvicorn
+flask
 aiohttp
 protobuf
 pycryptodome
